@@ -1,1 +1,115 @@
+"""
+Binance mispricing scanner (paper-trading by default)
 
+- Streams live best bid/ask for ~50 markets over one WebSocket
+- Prints live BTC price every second
+- Detects triangular mispricing: USDT -> BTC -> ALT -> USDT (and reverse)
+- Logs "paper" trades only. Live execution is a stub you must add yourself.
+
+Install:  pip install websockets
+Run:      python mispricing_bot.py
+"""
+import asyncio
+import json
+import time
+
+import websockets
+
+ALTS = ["ETH", "BNB", "SOL", "XRP", "ADA", "DOGE", "LTC", "LINK", "DOT", "AVAX",
+        "TRX", "ATOM", "UNI", "BCH", "ETC", "XLM", "NEAR", "APT", "ARB", "OP",
+        "FIL", "INJ", "AAVE", "SUI", "HBAR"]
+
+FEE = 0.001          # 0.1% per leg (lower with BNB discount / VIP tier)
+MIN_NET_EDGE = 0.0003  # only flag if profit after fees > 0.03%
+TRADE_SIZE_USDT = 100.0
+COOLDOWN_SEC = 2.0   # don't re-flag the same triangle repeatedly
+
+books = {}           # symbol -> (bid, ask)
+last_flag = {}
+paper_pnl = 0.0
+trades = 0
+
+
+def stream_url():
+    symbols = ["BTCUSDT"] + [f"{a}USDT" for a in ALTS] + [f"{a}BTC" for a in ALTS]
+    streams = "/".join(f"{s.lower()}@bookTicker" for s in symbols)
+    return f"wss://stream.binance.com:9443/stream?streams={streams}"
+
+
+def check_triangle(alt):
+    """Return (direction, net_edge) for the best triangle on this alt, or None."""
+    b_btc = books.get("BTCUSDT")
+    b_alt_usdt = books.get(f"{alt}USDT")
+    b_alt_btc = books.get(f"{alt}BTC")
+    if not (b_btc and b_alt_usdt and b_alt_btc):
+        return None
+    (btc_bid, btc_ask), (au_bid, au_ask), (ab_bid, ab_ask) = b_btc, b_alt_usdt, b_alt_btc
+    f = (1 - FEE) ** 3
+
+    # Forward: USDT -> BTC -> ALT -> USDT
+    fwd = (1 / btc_ask) / ab_ask * au_bid * f - 1
+    # Reverse: USDT -> ALT -> BTC -> USDT
+    rev = (1 / au_ask) * ab_bid * btc_bid * f - 1
+
+    best = max((fwd, "USDT>BTC>%s>USDT" % alt), (rev, "USDT>%s>BTC>USDT" % alt))
+    return (best[1], best[0]) if best[0] > MIN_NET_EDGE else None
+
+
+def on_update(symbol):
+    global paper_pnl, trades
+    if symbol == "BTCUSDT":
+        alts = ALTS
+    elif symbol.endswith("USDT"):
+        alts = [symbol[:-4]]
+    elif symbol.endswith("BTC"):
+        alts = [symbol[:-3]]
+    else:
+        return
+    now = time.time()
+    for alt in alts:
+        hit = check_triangle(alt)
+        if not hit:
+            continue
+        path, edge = hit
+        if now - last_flag.get(path, 0) < COOLDOWN_SEC:
+            continue
+        last_flag[path] = now
+        profit = TRADE_SIZE_USDT * edge
+        paper_pnl += profit
+        trades += 1
+        print(f"[GAP] {path}  net edge {edge*100:.3f}%  paper profit ${profit:.3f}")
+        # execute_live(path, TRADE_SIZE_USDT)  # <- add your own order logic here
+
+
+async def btc_ticker():
+    while True:
+        await asyncio.sleep(1)
+        b = books.get("BTCUSDT")
+        if b:
+            mid = (b[0] + b[1]) / 2
+            print(f"BTC {mid:,.2f} | markets live: {len(books)} | "
+                  f"paper trades: {trades} | paper PnL: ${paper_pnl:.2f}")
+
+
+async def listen():
+    while True:  # auto-reconnect
+        try:
+            async with websockets.connect(stream_url(), ping_interval=20) as ws:
+                print("Connected to Binance.")
+                async for raw in ws:
+                    d = json.loads(raw).get("data", {})
+                    if "s" in d:
+                        books[d["s"]] = (float(d["b"]), float(d["a"]))
+                        on_update(d["s"])
+        except Exception as e:
+            print("Connection lost, retrying in 3s:", e)
+            await asyncio.sleep(3)
+
+
+async def main():
+    await asyncio.gather(listen(), btc_ticker())
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+          
